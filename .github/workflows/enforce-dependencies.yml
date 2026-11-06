@@ -1,0 +1,67 @@
+# .github/workflows/enforce-dependencies.yml
+# Safety rule: an issue can't stay closed while any issue it depends on is still open.
+# If someone closes it too early, this workflow reopens it and comments with the open blockers.
+# Blockers come from GitHub's native "Blocked by" relationships and from
+# "Blocked by: #12, #15" lines in the issue body.
+
+name: Enforce issue dependencies
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+
+jobs:
+  check-blockers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+
+            // Closed as "not planned" is allowed (e.g. dropped nice-to-haves)
+            if (issue.state_reason === 'not_planned') return;
+
+            const blockers = new Set();
+
+            // 1. Native GitHub issue dependencies
+            try {
+              const res = await github.request(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by',
+                { owner, repo, issue_number: issue.number, per_page: 100 }
+              );
+              for (const b of res.data) blockers.add(b.number);
+            } catch (e) {
+              core.info(`Native dependencies not available: ${e.status ?? e.message}`);
+            }
+
+            // 2. "Blocked by: #n" lines in the issue body
+            const body = issue.body || '';
+            for (const line of body.split('\n')) {
+              if (/blocked by/i.test(line)) {
+                for (const m of line.matchAll(/#(\d+)/g)) blockers.add(Number(m[1]));
+              }
+            }
+
+            if (blockers.size === 0) return;
+
+            // Find which blockers are still open
+            const stillOpen = [];
+            for (const n of blockers) {
+              const { data } = await github.rest.issues.get({ owner, repo, issue_number: n });
+              if (data.state === 'open') stillOpen.push(`- #${n} ${data.title}`);
+            }
+
+            if (stillOpen.length === 0) return;
+
+            await github.rest.issues.update({
+              owner, repo, issue_number: issue.number, state: 'open'
+            });
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: issue.number,
+              body: `🔒 Reopened: this issue can't be closed until these are done:\n\n${stillOpen.join('\n')}`
+            });
